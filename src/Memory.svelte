@@ -1,9 +1,12 @@
 <script>
   import GenericSerial from "./generic-serial.js";
   import TerminalEmu from "./TerminalEmu.svelte";
+  import Popup from "./Popup.svelte";
   import { onMount } from "svelte";
 
   let terminal;
+  let popup_message;
+  let popup_message_data = {};
 
   let serial = new GenericSerial();
   serial.connect_callback = connect_callback;
@@ -33,7 +36,6 @@
 
   function send_callback(data) {}
 
-  let color_counter = 0;
   const colors = [
     [255, 0, 0],
     [0, 255, 0],
@@ -61,22 +63,21 @@
     [250, 128, 114],
   ];
 
-  let color_cache = {
-    ".bss": [128, 128, 128],
-    "": [255, 255, 255],
-  };
+  let color_counter = 0;
+  let thread_list;
 
-  function color_cache_reset() {
+  function thread_list_reset() {
     color_counter = 0;
-    color_cache = {
-      ".bss": [128, 128, 128],
-      "": [255, 255, 255],
+    thread_list = {
+      ".bss": { color: [128, 128, 128], size: 0 },
+      main: { color: [255, 255, 255], size: 0 },
     };
   }
+  thread_list_reset();
 
-  function color_cache_insert_thread(thread) {
-    if (!(thread in color_cache)) {
-      color_cache[thread] = colors[color_counter];
+  function thread_list_insert_thread(thread) {
+    if (!(thread in thread_list)) {
+      thread_list[thread] = { color: colors[color_counter], size: 0 };
       color_counter++;
     }
   }
@@ -94,13 +95,17 @@
 
   function memory_reset() {
     for (let index = 0; index <= SRAM_SIZE; index++) {
-      memory[index] = { thread: "", size: 0, alloc: false };
+      memory[index] = { thread: "", size: 0, alloc: false, history: [] };
     }
   }
 
   function memory_insert_static(addr, size) {
-    for (let index = addr; index <= size; index++) {
-      memory[index] = { thread: ".bss", size: 0, alloc: true };
+    for (let index = addr; index < addr + size; index++) {
+      memory[index] = { thread: ".bss", size: 0, alloc: true, history: [] };
+    }
+
+    if (size > 0) {
+      memory[addr] = { thread: ".bss", size: size, alloc: true, history: [] };
     }
   }
 
@@ -109,36 +114,56 @@
   console.log("SRAM size: %d", SRAM_SIZE);
 
   function mem_set_block(addr, alloc, thread, size) {
-    for (let i = 1; i < size / 4; i++) {
+    for (let i = 0; i < size / 4; i++) {
       if (memory[addr / 4 + i].alloc == alloc) {
-        console.error("Block crashed");
+        console.error(
+          "Block crashed",
+          addr / 4 + i,
+          memory[addr / 4 + i],
+          addr,
+          {
+            thread: thread,
+            size: size,
+            alloc: alloc,
+          }
+        );
       }
 
       memory[addr / 4 + i].alloc = alloc;
-      memory[addr / 4 + i].thread = thread;
+
+      if (alloc) {
+        memory[addr / 4 + i].thread = thread;
+        memory[addr / 4 + i].history.push("+" + thread + "[" + size + "]");
+      } else {
+        memory[addr / 4 + i].thread = "";
+        memory[addr / 4 + i].history.push("-" + thread + "[" + size + "]");
+      }
     }
   }
 
   function memory_get_size() {
+    for (let thread in thread_list) {
+      thread_list[thread].size = 0;
+    }
+
     let size = 0;
     for (let index = 0; index <= SRAM_SIZE; index++) {
       size += memory[index].size;
+      if (memory[index].thread != "" && memory[index].size > 0) {
+        thread_list[memory[index].thread].size += memory[index].size;
+      }
     }
 
     return size;
   }
 
   function memory_malloc(addr, thread, size) {
-    color_cache_insert_thread(thread);
+    thread_list_insert_thread(thread);
 
+    mem_set_block(addr, true, thread, size);
     memory[addr / 4].thread = thread;
     memory[addr / 4].size = size;
     memory[addr / 4].alloc = true;
-
-    mem_set_block(addr, true, thread, size);
-    // for (let i = 0; i < size / 4 + 2; i++) {
-    //   memory[addr / 4 + i - 1].alloc = true;
-    // }
   }
 
   function memory_free(addr, thread) {
@@ -161,8 +186,7 @@
       }
     }
 
-    mem_set_block(addr, false, "", memory[addr / 4].size);
-
+    mem_set_block(addr, false, thread, memory[addr / 4].size);
     memory[addr / 4].thread = "";
     memory[addr / 4].size = 0;
     memory[addr / 4].alloc = false;
@@ -175,6 +199,8 @@
     let addr = parseInt(split[2], 16) - SRAM_BASE;
     let size = 0;
 
+    if (name == "") name = "main";
+
     if (name == "PHStart") {
       let heap_start = parseInt(split[1], 16) - SRAM_BASE;
       let heap_end = parseInt(split[2], 16) - SRAM_BASE;
@@ -182,7 +208,7 @@
       console.log("--- HEAP INIT ---");
 
       memory_reset();
-      color_cache_reset();
+      thread_list_reset();
       memory_insert_static(0, heap_start / 4);
       memory_insert_static(heap_end / 4, Math.max(0, SRAM_SIZE - heap_end / 4));
     } else {
@@ -251,10 +277,16 @@
 
   may_be_connected();
 
+  let highlight = {
+    active: false,
+    start: 0,
+    end: 0,
+  };
+
   onMount(() => {
     // if (typeof canvas !== "undefined") {
     const ctx = canvas.getContext("2d");
-    ctx.translate(0.5, 0.5);
+    // ctx.translate(0.5, 0.5);
     ctx.imageSmoothingEnabled = false;
     let frame = requestAnimationFrame(loop);
 
@@ -267,55 +299,148 @@
         const i = p / 4;
         const x = i % canvas.width;
         const y = (i / canvas.width) >>> 0;
-        // i = x + SRAM_W*y;
 
         let c = [0, 0, 0];
         if (memory[i].alloc) {
-          c = color_cache[memory[i].thread];
+          c = thread_list[memory[i].thread].color.slice();
         }
 
-        //   const r = 64 + (128 * x) / canvas.width + 64 * Math.sin(t / 1000);
-        //   const g = 64 + (128 * y) / canvas.height + 64 * Math.cos(t / 1000);
-        //   const b = 128;
+        if (c[0] > 200) c[0] -= 55;
+        if (c[1] > 200) c[1] -= 55;
+        if (c[2] > 200) c[2] -= 55;
+
+        c[4] = 255;
+        if (memory[i].size > 0) {
+          c[0] += 55;
+          c[1] += 55;
+          c[2] += 55;
+        }
+
+        if (highlight.active) {
+          if (i >= highlight.start && i < highlight.end) {
+            c[0] = 0;
+            c[1] = 255;
+            c[2] = 0;
+          }
+        }
 
         imageData.data[p + 0] = c[0];
         imageData.data[p + 1] = c[1];
         imageData.data[p + 2] = c[2];
-        imageData.data[p + 3] = 255;
-
-        // console.log(x, y);
+        imageData.data[p + 3] = c[4];
       }
-
-      // const addr = 256 * 4;
-      // imageData.data[addr + 0] = 255;
-      // imageData.data[addr + 1] = 0;
-      // imageData.data[addr + 2] = 0;
-      // imageData.data[addr + 3] = 255;
-
-      // for (let x = 0; x < SRAM_W; x++) {
-      //   for (let y = 0; y < SRAM_H - 10; y++) {
-      //     var x = index % columns;
-      //     var y = index / columns;
-
-      //     // const addr = (x * SRAM_W + y) * 4;
-      //     imageData.data[addr + 0] = 255;
-      //     imageData.data[addr + 1] = 0;
-      //     imageData.data[addr + 2] = 0;
-      //     imageData.data[addr + 3] = 255;
-      //   }
-      // }
-
       ctx.putImageData(imageData, 0, 0);
     }
-    // }
 
     return () => {
       cancelAnimationFrame(frame);
     };
   });
+
+  let popit = {
+    show: false,
+    x: 0,
+    y: 0,
+    address: "",
+    size: 0,
+    thread: "",
+    history: [],
+  };
+
+  function canvas_click(e) {
+    let rect = this.getBoundingClientRect();
+    let pos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    let mem_pos = {
+      x: Math.floor((canvas.width / rect.width) * pos.x),
+      y: Math.floor((canvas.height / rect.height) * pos.y),
+    };
+    let mem_addr = mem_pos.y * canvas.width + mem_pos.x;
+
+    if (mem_addr > 0) {
+      let start = mem_addr;
+      while (start >= 0) {
+        if (memory[start].size > 0 || memory[start].alloc == false) break;
+        start--;
+      }
+
+      let end = mem_addr + 1;
+      while (end < SRAM_SIZE) {
+        if (memory[end].size != 0 || memory[end].alloc == false) break;
+        end++;
+      }
+
+      popup_message_data.show = true;
+      popup_message_data.thread = memory[mem_addr].thread;
+      popup_message_data.address =
+        "0x" + (mem_addr * 4).toString(16) + " 0x" + (start * 4).toString(16);
+      popup_message_data.size = memory[start].size;
+      popup_message_data.history = memory[mem_addr].history;
+
+      popup_message.show();
+    }
+  }
+
+  function mouse_enter() {
+    popit.show = true;
+  }
+
+  function mouse_leave() {
+    popit.show = false;
+    highlight.active = false;
+  }
+
+  function mouse_move(e) {
+    popit.x = e.clientX + 20;
+    popit.y = e.clientY + 20;
+
+    let rect = this.getBoundingClientRect();
+    let pos = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    let mem_pos = {
+      x: Math.floor((canvas.width / rect.width) * pos.x),
+      y: Math.floor((canvas.height / rect.height) * pos.y),
+    };
+    let mem_addr = mem_pos.y * canvas.width + mem_pos.x;
+
+    if (mem_addr > 0) {
+      let start = mem_addr;
+      while (start >= 0) {
+        if (memory[start].size > 0 || memory[start].alloc == false) break;
+        start--;
+      }
+
+      let end = mem_addr + 1;
+      while (end < SRAM_SIZE) {
+        if (memory[end].size != 0 || memory[end].alloc == false) break;
+        end++;
+      }
+
+      popit.show = true;
+      popit.thread = memory[mem_addr].thread;
+      popit.address =
+        "0x" + (mem_addr * 4).toString(16) + " 0x" + (start * 4).toString(16);
+      popit.size = memory[start].size;
+      popit.history = memory[mem_addr].history;
+
+      highlight.active = true;
+      highlight.start = start;
+      highlight.end = end;
+      // console.log(start, end);
+    }
+  }
 </script>
 
 <div class="screen">
+  {#if popit.show}
+    <div class="popit" style="left: {popit.x}px; top: {popit.y}px;">
+      {popit.address}[{popit.size}]<br />
+      {popit.thread}
+      <div>
+        {#each Object.entries(popit.history) as [key, data]}
+          {data}<br />
+        {/each}
+      </div>
+    </div>
+  {/if}
   <div class="wrapper">
     {#if connected == false}
       <div class="wrapper-button">
@@ -330,21 +455,35 @@
         bind:this={canvas}
         width={SRAM_W}
         height={SRAM_H}
+        on:mouseenter={mouse_enter}
+        on:mousemove={mouse_move}
+        on:mouseleave={mouse_leave}
+        on:mousedown={canvas_click}
       />
 
       <div class="threads">
-        {#each Object.entries(color_cache) as [thread, color]}
+        {#each Object.entries(thread_list) as [thread, data]}
           <div
             class="thread"
-            style="color: rgb({color[0]}, {color[1]}, {color[2]});"
+            style="color: rgb({data.color[0]}, {data.color[1]}, {data
+              .color[2]});"
           >
-            {thread}
+            {thread}[{data.size}]
           </div>
         {/each}
       </div>
     </div>
   </div>
   <div class="wrapper"><TerminalEmu bind:this={terminal} /></div>
+  <Popup bind:this={popup_message}>
+    {popup_message_data.address}[{popup_message_data.size}]<br />
+    {popup_message_data.thread}
+    <div>
+      {#each Object.entries(popup_message_data.history) as [key, data]}
+        {data}&nbsp;
+      {/each}
+    </div>
+  </Popup>
 </div>
 
 <style>
@@ -439,5 +578,22 @@
 
   .thread {
     padding: 5px;
+  }
+
+  .popit {
+    background-color: #000000;
+    padding: 5px 10px;
+    pointer-events: none;
+    position: absolute;
+    z-index: 6969;
+    max-height: 500px;
+    overflow: auto;
+  }
+
+  .sram_canvas {
+    image-rendering: -moz-crisp-edges;
+    image-rendering: -webkit-crisp-edges;
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
   }
 </style>
